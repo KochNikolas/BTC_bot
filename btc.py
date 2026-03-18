@@ -41,6 +41,7 @@ def load_config():
             "EXIT_THRESHOLD": 0.90,
             "COOLDOWN_SEC": 30,
             "STAKE_USD": 1.0,
+            "MIN_RESERVE_USD": 0.0,
             "TRADE_DONE": False,
             "POLY_API_KEY": "",
             "POLY_API_SECRET": "",
@@ -285,58 +286,68 @@ def check_geoblock():
     return False
 
 def get_live_client(cfg):
+    """Initialisiert den ClobClient mit Proxy-Wallet Support (Magic Link)."""
     if cfg.get("DRY_RUN", True):
         return ClobClient(host=POLY_HOST)
     
     try:
-        # Deine Daten aus der Config & Log
         pk = cfg.get("POLY_PRIVATE_KEY")
         funder_addr = "0xAC0D49bEf9C3B97F64193C0DA507848EF9e64D49"
         
-        # SCHRITT 1: L1-Client (Nur mit Private Key, um API-Keys zu validieren)
+        # 1. Temporärer Client zur Ableitung der Credentials
         temp_client = ClobClient(host=POLY_HOST, key=pk, chain_id=POLYGON)
-        
-        # SCHRITT 2: API Credentials holen/ableiten
         creds = temp_client.create_or_derive_api_creds()
         
-        # SCHRITT 3: Der finale L2-Client (Der "Handels-Client")
-        # Hier werden signature_type=1 und funder fest verdrahtet
+        # 2. Finaler Handels-Client mit Proxy-Settings
         client = ClobClient(
             host=POLY_HOST,
             key=pk,
             chain_id=POLYGON,
             creds=creds,
-            signature_type=1, # WICHTIG: 1 für Proxy/Magic
-            funder=funder_addr # WICHTIG: Die Adresse mit dem Geld
+            signature_type=1, # 1 = Proxy/Magic Wallet
+            funder=funder_addr # Adresse mit dem Kapital
         )
-        
         return client
     except Exception as e:
         print(f" ❌ KRITISCHER INITIALISIERUNGSFEHLER: {e}")
         return ClobClient(host=POLY_HOST)
 
 def place_live_order(client, token_id, amount_usdc, limit_price, side="buy"):
+    """Führt eine Live-Order auf Polymarket aus mit Slippage-Schutz und API-Limits."""
     global LAST_ORDER_TS
     
-    if IS_GEOBLOCKED:
-        print("\n\033[91m ❌ LIVE-ORDER ABGEBROCHEN: Geo-Blocking!\033[0m")
-        return None
-
-    now = time.time()
-    if now - LAST_ORDER_TS < 5:
-        time.sleep(5 - (now - LAST_ORDER_TS))
+    # Rate-Limit Schutz (1 Sekunde zwischen Orders)
+    if time.time() - LAST_ORDER_TS < 1.0:
+        time.sleep(1)
 
     try:
-        order_side = BUY if side == "buy" else SELL
-        # Wir nutzen einen kleineren Slippage-Buffer für Limit Orders
-        slippage = 0.01 
-        price = round(limit_price * (1 + slippage), 2) if side == "buy" else round(limit_price * (1 - slippage), 2)
-        token_qty = round(amount_usdc / limit_price, 2)
-
-        print(f" 📡 Sende LIVE {side.upper()} Order: {token_qty} Tokens @ {price*100:.1f}¢")
+        # 1. Token-Menge berechnen
+        token_qty = amount_usdc / limit_price
         
-        # FIX: Wir lassen die Nonce weg und nutzen die Standard-Order-Erstellung
-        # Die Bibliothek erkennt signature_type=1 aus der Client-Initialisierung
+        # 2. API-Limit: Minimum 5 Tokens pro Order (vermeidet 400er Fehler)
+        if token_qty < 5.0:
+            token_qty = 5.0
+            
+        # Präzision: Max 2 Dezimalstellen wie von CLOB gefordert
+        token_qty = round(token_qty, 2)
+
+        # 3. Preis mit Slippage-Puffer (2%)
+        slippage = 0.02
+        if side == "buy":
+            price = round(limit_price * (1 + slippage), 2)
+            order_side = "BUY"
+        else:
+            price = round(limit_price * (1 - slippage), 2)
+            order_side = "SELL"
+
+        # Validierung des Preisbereichs [0.01, 0.99]
+        price = max(0.01, min(0.99, price))
+
+        print(f" 📡 Sende LIVE {side.upper()} @ {price*100:.1f}¢ | Menge: {token_qty}")
+        
+        # 4. Order-Argumente erstellen
+        from py_clob_client.clob_types import OrderArgs
+        
         order_args = OrderArgs(
             price=price,
             size=token_qty,
@@ -344,21 +355,23 @@ def place_live_order(client, token_id, amount_usdc, limit_price, side="buy"):
             token_id=token_id
         )
         
-        # WICHTIG: create_order signiert, post_order sendet.
+        # 5. Order signieren UND absenden
+        # Erst Signatur lokal erstellen:
         signed_order = client.create_order(order_args)
+        # Dann die SIGNIERTE Order an die API posten:
         resp = client.post_order(signed_order)
         
         LAST_ORDER_TS = time.time()
         
-        if resp and isinstance(resp, dict) and resp.get("success"):
-            print(f" ✅ Live Order erfolgreich! ID: {resp.get('orderID')}")
+        if resp and resp.get("success"):
+            print(f" ✅ Order erfolgreich! ID: {resp.get('orderID')}")
             return resp
         else:
-            print(f" ❌ API Ablehnung: {resp}")
+            print(f" ❌ Order fehlgeschlagen: {resp}")
             return None
-            
+
     except Exception as e:
-        print(f" ❌ Signatur-Fehler: {e}")
+        print(f" ❌ EXCEPTION in place_live_order: {e}")
         return None
 
 # =============================================================
@@ -443,6 +456,22 @@ def main():
     print("\033[1m" + "="*65)
     print(f" 🚀 POLYMARKET BTC VALUE-BOT")
     print("="*65 + "\033[0m")
+
+    # 🧹 Start-Cleanup: Alle offenen Orders löschen (Sicherheit & Kapitalfreigabe)
+    if not cfg_initial.get("DRY_RUN", True):
+        try:
+            print("\n 🧹 Bereinige offene Orders...")
+            open_orders = client.get_open_orders()
+            if open_orders:
+                for order in open_orders:
+                    oid = order.get("orderID") or order.get("id")
+                    if oid:
+                        client.cancel_order(oid)
+                print(f" ✅ {len(open_orders)} offene Orders gelöscht.")
+            else:
+                print(" ✅ Keine offenen Orders gefunden.")
+        except Exception as e:
+            print(f" ⚠️ Warnung beim Löschen offener Orders: {e}")
     
     last_interval = None
     market_info = None
@@ -687,7 +716,9 @@ def main():
             if not is_blocked:
                 # Stake aus Config laden (fixer Betrag)
                 stake = cfg.get("STAKE_USD", 1.0)
-                if stake > 0 and available_balance >= stake:
+                min_reserve = cfg.get("MIN_RESERVE_USD", 0.0)
+                
+                if stake > 0 and (available_balance - stake) >= min_reserve:
                     print(f"\n\033[1m\033[92mTRADE AUSGELÖST: Kaufe {t_side} bei {t_price*100:.1f}¢ | Edge {b_edge*100:.2f}%\033[0m")
                     
                     order_success = True
