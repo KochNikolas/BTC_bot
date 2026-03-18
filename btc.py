@@ -525,9 +525,7 @@ def main():
         interval_start = (now_ts // 300) * 300
         interval_end = interval_start + 300
         secs_left = interval_end - now_ts
-        
-        trade_done = cfg.get("TRADE_DONE", False)
-        
+                
         if interval_start != last_interval:
             last_interval = interval_start
             # Kein automatisches Zurücksetzen von TRADE_DONE mehr nötig
@@ -684,7 +682,7 @@ def main():
                     profit_usdc = active_pos['stake'] * change_pct
                     available_balance += (active_pos['stake'] + profit_usdc)
                     
-                    color = "\033[92m" if is_tp else "\033[91m"
+                    color = "\033[92m" if change_pct >= 0 else "\033[91m"
                     tag = "🎯 TAKE PROFIT" if is_tp else ("🛑 STOP LOSS" if is_sl else ("⚠️ LIMIT REACHED" if is_limit_reached else "⏰ RUNDEN-ENDE"))
                     print(f"\n{color}{tag}: Verkauf {active_pos['side']} bei {curr_p*100:.1f}¢ ({change_pct*100:+.1f}%)\033[0m")
                     
@@ -719,7 +717,7 @@ def main():
                 min_reserve = cfg.get("MIN_RESERVE_USD", 0.0)
                 
                 if stake > 0 and (available_balance - stake) >= min_reserve:
-                    print(f"\n\033[1m\033[92mTRADE AUSGELÖST: Kaufe {t_side} bei {t_price*100:.1f}¢ | Edge {b_edge*100:.2f}%\033[0m")
+                    print(f"\n\033[1m\033[94mTRADE AUSGELÖST: Kaufe {t_side} bei {t_price*100:.1f}¢ | Edge {b_edge*100:.2f}%\033[0m")
                     
                     order_success = True
                     if not dry_run:
